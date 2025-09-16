@@ -1,0 +1,306 @@
+#include <WiFi.h>
+#include <WiFiClient.h>
+
+// ---------- Wi-Fi & Bulb Settings ----------
+const char* ssid     = "";
+const char* password = "";
+const char* bulbIP   = "";   // KL130 IP
+const int   bulbPort = 9999;
+
+
+WiFiClient client;
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
+
+// ---------- Helpers ----------
+static inline int clampInt(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+// Show raw bytes (helps confirm what Excel actually sent)
+void printHex(const String& s) {
+  Serial.print("DBG:HEX=");
+  for (size_t i = 0; i < s.length(); i++) {
+    char buf[6];
+    snprintf(buf, sizeof(buf), " %02X", (uint8_t)s[i]);
+    Serial.print(buf);
+  }
+  Serial.println();
+}
+
+// Normalize delimiters from Excel/Serial (quotes, spaces, tabs, semicolons, pipes -> commas)
+String normalizeDelimiters(String s) {
+  s.trim();
+  s.replace("\"", "");    // strip any quotes
+  s.replace('\t', ',');   // tabs to comma
+  s.replace(';', ',');    // semicolons to comma
+  s.replace('|', ',');    // pipes to comma
+  s.replace(':', ',');    // colons to comma
+
+  // If still no commas but spaces exist, treat spaces as commas
+  if (s.indexOf(',') < 0 && s.indexOf(' ') >= 0) {
+    while (s.indexOf("  ") >= 0) s.replace("  ", " ");
+    s.replace(' ', ',');
+  }
+
+  // Collapse duplicate commas
+  while (s.indexOf(",,") >= 0) s.replace(",,", ",");
+
+  // Trim trailing comma
+  if (s.endsWith(",")) s.remove(s.length() - 1);
+
+  return s;
+}
+
+// Split a CSV line into up to maxParts tokens
+void splitCSV(const String& line, String out[], int maxParts) {
+  int start = 0, part = 0;
+  while (part < maxParts) {
+    int comma = line.indexOf(',', start);
+    if (comma < 0) {
+      out[part++] = line.substring(start);
+      break;
+    }
+    out[part++] = line.substring(start, comma);
+    start = comma + 1;
+  }
+  while (part < maxParts) out[part++] = "";
+  for (int i = 0; i < maxParts; i++) out[i].trim();
+}
+
+void printParts(String parts[], int n) {
+  Serial.print("DBG:PARTS=");
+  for (int i = 0; i < n; ++i) {
+    Serial.print("[");
+    Serial.print(parts[i]);
+    Serial.print("]");
+  }
+  Serial.println();
+}
+
+// Parse integer or return -1 if blank
+int parseOrOmit(const String& s) {
+  if (s.length() == 0) return -1;
+  return s.toInt();
+}
+
+// Add "key:value" if val present
+void addKV(String& payload, bool& first, const char* key, int val) {
+  if (val < 0) return;
+  if (!first) payload += ",";
+  payload += "\"";
+  payload += key;
+  payload += "\":";
+  payload += String(val);
+  first = false;
+}
+
+// TP-Link decrypt (XOR rolling key, init=171)
+String decryptTPLink(const uint8_t* buf, size_t len) {
+  uint8_t key = 171;
+  String out;
+  out.reserve(len);
+  for (size_t i = 0; i < len; i++) {
+    uint8_t dec = key ^ buf[i];
+    key = buf[i];
+    out += (char)dec;
+  }
+  return out;
+}
+
+// Send JSON via TP-Link local protocol (4-byte len + XOR stream), print reply if any
+bool sendToKasa(const String& json) {
+  if (!client.connect(bulbIP, bulbPort)) {
+    Serial.println("ERR:CONNECTION");
+    return false;
+  }
+
+  const size_t n = json.length();
+  uint8_t header[4] = {
+    (uint8_t)((n >> 24) & 0xFF),
+    (uint8_t)((n >> 16) & 0xFF),
+    (uint8_t)((n >>  8) & 0xFF),
+    (uint8_t)((n      ) & 0xFF)
+  };
+  client.write(header, 4);
+
+  uint8_t key = 171;
+  for (size_t i = 0; i < n; i++) {
+    uint8_t enc = key ^ (uint8_t)json[i];
+    key = enc;
+    client.write(&enc, 1);
+  }
+  client.flush();
+
+  // Read reply (optional but helpful)
+  uint32_t start = millis();
+  while (client.available() < 4 && (millis() - start) < 500) delay(5);
+
+  if (client.available() >= 4) {
+    uint8_t lenHdr[4];
+    client.read(lenHdr, 4);
+    uint32_t plen = ((uint32_t)lenHdr[0] << 24) |
+                    ((uint32_t)lenHdr[1] << 16) |
+                    ((uint32_t)lenHdr[2] << 8)  |
+                    ((uint32_t)lenHdr[3]);
+
+    start = millis();
+    std::unique_ptr<uint8_t[]> buf(new uint8_t[plen]);
+    size_t got = 0;
+    while (got < plen && (millis() - start) < 1000) {
+      int avail = client.available();
+      if (avail > 0) {
+        int nread = client.read(buf.get() + got, plen - got);
+        if (nread > 0) got += nread;
+      } else {
+        delay(5);
+      }
+    }
+    if (got == plen) {
+      String dec = decryptTPLink(buf.get(), plen);
+      Serial.print("RESP:");
+      Serial.println(dec);
+    } else {
+      Serial.println("RESP:TIMEOUT_OR_PARTIAL");
+    }
+  } else {
+    Serial.println("RESP:NONE");
+  }
+
+  client.stop();
+  Serial.println("ACK:SENT");
+  return true;
+}
+
+// Build & send transition_light_state. Pass -1 to omit fields.
+bool sendLightState(
+  int on_off,          // 0/1  (-1 omit)
+  int hue,             // 0..360 (-1 omit)
+  int saturation,      // 0..100 (-1 omit)
+  int brightness,      // 0..100 (-1 omit)
+  int color_temp,      // 2500..9000 (-1 omit; 0 = force color mode)
+  int transition_ms    // 0..10000 (-1 omit)
+) {
+  String payload = "{\"smartlife.iot.smartbulb.lightingservice\":{\"transition_light_state\":{";
+  bool first = true;
+
+  addKV(payload, first, "on_off",            on_off);
+  addKV(payload, first, "hue",               hue);
+  addKV(payload, first, "saturation",        saturation);
+  addKV(payload, first, "brightness",        brightness);
+  addKV(payload, first, "color_temp",        color_temp);
+  addKV(payload, first, "transition_period", transition_ms);
+
+  payload += "}}}";
+
+  Serial.print("DBG:JSON=");
+  Serial.println(payload);
+
+  return sendToKasa(payload);
+}
+
+// ---------- Arduino ----------
+void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+  Serial.print("Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(400);
+  }
+  Serial.println("\nWi-Fi connected.");
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+  if (!Serial.available()) return;
+
+  String raw = Serial.readStringUntil('\n');
+  raw.trim();
+  if (raw.length() == 0) return;
+
+  // Blink LED on each row received
+  static bool led = false;
+  led = !led;
+  digitalWrite(LED_BUILTIN, led);
+
+  Serial.print("DBG:RAW=");
+  Serial.println(raw);
+  printHex(raw);
+
+  String line = normalizeDelimiters(raw);
+
+  String parts[6]; // even though you use 4 channels, we accept up to 6
+  splitCSV(line, parts, 6);
+  printParts(parts, 6);
+
+  String cmd = parts[0];
+
+  // 4-channel mapping:
+  // COLOR: [cmd][hue][sat][bri]
+  // TEMP:  [cmd][tempK][bri?][transition?]
+  // ON/OFF: [cmd][transition?]
+  int hue   = parseOrOmit(parts[1]);
+  int sat   = parseOrOmit(parts[2]);
+  int bri   = parseOrOmit(parts[3]);
+  int tempK = parseOrOmit(parts[1]);        // re-used for TEMP
+  int trans = -1;
+
+  // Prefer CH4 as transition for TEMP, else CH2 for ON/OFF
+  // (you can still send transition via a 5th/6th token if you move to 6 channels later)
+  if (cmd.equalsIgnoreCase("TEMP")) {
+    // transition in CH4 if provided
+    trans = parseOrOmit(parts[3]);
+  } else if (cmd.equalsIgnoreCase("ON") || cmd.equalsIgnoreCase("OFF")) {
+    // optional transition in CH2
+    trans = parseOrOmit(parts[1]);
+  } else {
+    // If you later use 6 channels, CH6 can be transition
+    int transMaybe = parseOrOmit(parts[5]);
+    if (transMaybe >= 0) trans = transMaybe;
+  }
+
+  // Clamp where applicable
+  if (hue   >= 0) hue   = clampInt(hue,   0, 360);
+  if (sat   >= 0) sat   = clampInt(sat,   0, 100);
+  if (bri   >= 0) bri   = clampInt(bri,   0, 100);
+  if (tempK >= 0) tempK = clampInt(tempK, 2500, 9000);
+  if (trans >= 0) trans = clampInt(trans, 0, 10000);
+
+  if (cmd.equalsIgnoreCase("ON") || cmd == "1") {
+    sendLightState(1, -1, -1, -1, -1, trans);
+  }
+  else if (cmd.equalsIgnoreCase("OFF") || cmd == "0") {
+    sendLightState(0, -1, -1, -1, -1, trans);
+  }
+  else if (cmd.equalsIgnoreCase("COLOR")) {
+    // Expect H,S,B in CH2..CH4
+    if (hue < 0 || sat < 0 || bri < 0) {
+      Serial.println("ERR:COLOR REQUIRES H,S,B (got H=" + String(hue) +
+                     " S=" + String(sat) + " B=" + String(bri) + ")");
+      return;
+    }
+    if (sat == 0) sat = 1; // avoid zero-sat edge case locking white mode
+    // Force COLOR mode by setting color_temp = 0 (critical for some KL130 firmwares)
+    sendLightState(1, hue, sat, bri, 0, trans);
+  }
+  else if (cmd.equalsIgnoreCase("TEMP")) {
+    // Expect TempK in CH2; Bri optional in CH3; Transition optional in CH4
+    if (tempK < 0) {
+      Serial.println("ERR:TEMP REQUIRES TEMP_K in CH2");
+      return;
+    }
+    sendLightState(1, -1, -1, bri, tempK, trans);
+  }
+  else {
+    Serial.println("ERR:UNKNOWN_CMD " + cmd);
+  }
+}
