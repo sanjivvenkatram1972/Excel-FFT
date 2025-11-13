@@ -1,0 +1,112 @@
+#include <Arduino.h>
+
+// Motor pins
+const int var_IN1_pin = 5;
+const int var_IN2_pin = 6;
+const int var_ENA_pin = 7;
+
+// PWM setup
+const int var_PWM_channel  = 4;
+const int var_PWM_freq_hz  = 1000;
+const int var_PWM_res_bits = 10;
+const int var_MAX_duty     = (1 << var_PWM_res_bits) - 1;
+int var_last_direction     = 1;
+int var_current_duty       = 350;   // remember last valid duty
+
+// Encoder (Channel A only)
+const int   var_ENC_A_pin        = 8;
+const float var_counts_per_rev   = 600.0f;
+volatile uint32_t var_pulse_count = 0;
+
+// Timing for speed output
+const uint32_t var_interval_ms = 100;
+uint32_t var_last_ms = 0;
+bool var_header_sent = false;
+
+void IRAM_ATTR var_isr_encA() {
+  var_pulse_count++;
+}
+
+void setDirection(int var_dir) {
+  if (var_dir == 2) {
+    digitalWrite(var_IN1_pin, LOW);
+    digitalWrite(var_IN2_pin, HIGH);
+    var_last_direction = 2;
+  } else {
+    digitalWrite(var_IN1_pin, HIGH);
+    digitalWrite(var_IN2_pin, LOW);
+    var_last_direction = 1;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(5); // very short so parse / reads don't block long
+
+  pinMode(var_IN1_pin, OUTPUT);
+  pinMode(var_IN2_pin, OUTPUT);
+  pinMode(var_ENA_pin, OUTPUT);
+  setDirection(var_last_direction);
+
+  ledcAttachChannel(var_ENA_pin, var_PWM_freq_hz, var_PWM_res_bits, var_PWM_channel);
+  ledcWriteChannel(var_PWM_channel, var_current_duty);
+
+  pinMode(var_ENC_A_pin, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(var_ENC_A_pin), var_isr_encA, RISING);
+
+  delay(500);
+  Serial.println("rpm");
+  var_header_sent = true;
+}
+
+void loop() {
+  // Non‑blocking line read
+  if (Serial.available()) {
+    String var_line = Serial.readStringUntil('\n');
+    var_line.trim();
+    if (var_line.length()) {
+      int commaIndex = var_line.indexOf(',');
+      if (commaIndex > 0) {
+        String dutyStr = var_line.substring(0, commaIndex);
+        String dirStr  = var_line.substring(commaIndex + 1);
+        dutyStr.trim();
+        dirStr.trim();
+
+        // Update duty only if dutyStr has at least one digit
+        bool dutyHasDigit = false;
+        for (uint16_t i=0;i<dutyStr.length();++i) {
+          if (isDigit(dutyStr[i])) { dutyHasDigit = true; break; }
+        }
+        if (dutyHasDigit) {
+          int d = dutyStr.toInt();
+          if (d < 0) d = 0;
+          if (d > var_MAX_duty) d = var_MAX_duty;
+          var_current_duty = d;
+          ledcWriteChannel(var_PWM_channel, var_current_duty);
+        }
+
+        // Update direction only if dirStr begins with 1 or 2
+        if (dirStr.length() && (dirStr[0] == '1' || dirStr[0] == '2')) {
+          int dir = dirStr.toInt();
+            setDirection(dir);
+        }
+      }
+      // If line has no comma or no digits, ignore (keeps last duty)
+    }
+  }
+
+  uint32_t var_now_ms = millis();
+  if (var_now_ms - var_last_ms >= var_interval_ms && var_header_sent) {
+    var_last_ms = var_now_ms;
+
+    noInterrupts();
+    uint32_t pulses = var_pulse_count;
+    var_pulse_count = 0;
+    interrupts();
+
+    float interval_s = var_interval_ms / 1000.0f;
+    float var_rpm = (pulses / var_counts_per_rev) / interval_s * 60.0f;
+
+    Serial.println(var_rpm, 3);
+  }
+}
