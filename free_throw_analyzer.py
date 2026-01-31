@@ -30,14 +30,14 @@ def list_available_videos(directory):
     Returns:
         List of video filenames found in the directory
     """
-    video_extensions = ['.mp4', '.mov', '.avi', '.mkv', '.MP4', '.MOV', '.AVI', '.MKV']
+    video_extensions = ['.mp4', '.mov', '.avi', '.mkv']
     video_dir = Path(directory)
     
     if not video_dir.exists():
         print(f"❌ Directory not found: {directory}")
         return []
     
-    videos = [f.name for f in video_dir.iterdir() if f.suffix in video_extensions]
+    videos = [f.name for f in video_dir.iterdir() if f.suffix.lower() in video_extensions]
     return videos
 
 
@@ -135,11 +135,8 @@ if __name__ == "__main__":
     print("🏀 FREE THROW ANALYZER")
     print("=" * 70)
     
-    # Convert to Path object for better handling
-    video_dir = Path(VIDEO_CONFIG['VIDEO_DIR'])
-    
     # Build full video path from config
-    video_path = os.path.join(VIDEO_CONFIG['VIDEO_DIR'], VIDEO_CONFIG['VIDEO_FILENAME'])
+    video_path = str(Path(VIDEO_CONFIG['VIDEO_DIR']) / VIDEO_CONFIG['VIDEO_FILENAME'])
     
     print(f"\n📂 Configuration:")
     print(f"   Video directory: {VIDEO_CONFIG['VIDEO_DIR']}")
